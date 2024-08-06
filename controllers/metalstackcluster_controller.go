@@ -23,6 +23,9 @@ import (
 	"github.com/go-logr/logr"
 	api "github.com/metal-stack/cluster-api-provider-metalstack/api/v1alpha4"
 	metalgo "github.com/metal-stack/metal-go"
+	"github.com/metal-stack/metal-go/api/client/ip"
+	"github.com/metal-stack/metal-go/api/client/network"
+	"github.com/metal-stack/metal-go/api/models"
 	"github.com/metal-stack/metal-lib/pkg/tag"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -42,18 +45,18 @@ import (
 
 // MetalStackClusterReconciler reconciles a MetalStackCluster object
 type MetalStackClusterReconciler struct {
-	Client           client.Client
-	Log              logr.Logger
-	MetalStackClient MetalStackClient
-	Scheme           *runtime.Scheme
+	Client client.Client
+	Log    logr.Logger
+	mc     metalgo.Client
+	Scheme *runtime.Scheme
 }
 
-func NewMetalStackClusterReconciler(metalClient MetalStackClient, mgr manager.Manager) *MetalStackClusterReconciler {
+func NewMetalStackClusterReconciler(c metalgo.Client, mgr manager.Manager) *MetalStackClusterReconciler {
 	return &MetalStackClusterReconciler{
-		Client:           mgr.GetClient(),
-		Log:              ctrl.Log.WithName("controllers").WithName("MetalStackCluster"),
-		MetalStackClient: metalClient,
-		Scheme:           mgr.GetScheme(),
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("controllers").WithName("MetalStackCluster"),
+		mc:     c,
+		Scheme: mgr.GetScheme(),
 	}
 }
 
@@ -77,7 +80,7 @@ func (r *MetalStackClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *MetalStackClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, err error) {
 	logger := r.Log.WithValues("MetalStackCluster", req.NamespacedName)
 
-	logger.Info("Starting MetalStackCluster reconcilation")
+	logger.Info("Starting MetalStackCluster reconciliation")
 
 	// Fetch the MetalStackCluster.
 	metalCluster := &api.MetalStackCluster{}
@@ -113,7 +116,7 @@ func (r *MetalStackClusterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	if annotations.IsPaused(cluster, metalCluster) {
-		logger.Info("reconcilation is paused for this object")
+		logger.Info("reconciliation is paused for this object")
 		return ctrl.Result{Requeue: true}, nil
 	}
 
@@ -148,18 +151,18 @@ func (r *MetalStackClusterReconciler) reconcileDelete(ctx context.Context, logge
 
 	// Delete network
 	logger.Info("Deleting Cluster network")
-	resp, err := r.MetalStackClient.NetworkFind(&metalgo.NetworkFindRequest{
-		ID:        metalCluster.Spec.PrivateNetworkID,
-		ProjectID: &metalCluster.Spec.ProjectID,
-	})
+	_, err = r.mc.Network().FindNetwork(&network.FindNetworkParams{
+		ID: *metalCluster.Spec.PrivateNetworkID,
+	}, nil)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to list networks: %w", err)
 	}
 
-	if len(resp.Networks) == 1 {
-		if _, err := r.MetalStackClient.NetworkFree(*metalCluster.Spec.PrivateNetworkID); err != nil {
-			return ctrl.Result{Requeue: true}, nil
-		}
+	_, err = r.mc.Network().DeleteNetwork(&network.DeleteNetworkParams{
+		ID: *metalCluster.Spec.PrivateNetworkID,
+	}, nil)
+	if err != nil {
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	controllerutil.RemoveFinalizer(metalCluster, api.MetalStackClusterFinalizer)
@@ -205,42 +208,48 @@ func (r *MetalStackClusterReconciler) reconcile(ctx context.Context, logger logr
 }
 
 func (r *MetalStackClusterReconciler) allocateNetwork(metalCluster *api.MetalStackCluster) error {
-	resp, err := r.MetalStackClient.NetworkAllocate(&metalgo.NetworkAllocateRequest{
+	resp, err := r.mc.Network().AllocateNetwork(&network.AllocateNetworkParams{Body: &models.V1NetworkAllocateRequest{
 		Description: metalCluster.Name,
 		Labels:      map[string]string{tag.ClusterID: metalCluster.Name},
 		Name:        metalCluster.Spec.Partition,
-		PartitionID: metalCluster.Spec.Partition,
-		ProjectID:   metalCluster.Spec.ProjectID,
-	})
+		Partitionid: metalCluster.Spec.Partition,
+		Projectid:   metalCluster.Spec.ProjectID,
+	}}, nil)
 	if err != nil {
 		return err
 	}
 
-	metalCluster.Spec.PrivateNetworkID = resp.Network.ID
+	metalCluster.Spec.PrivateNetworkID = resp.Payload.ID
 
 	return nil
 }
 
 func (r *MetalStackClusterReconciler) allocateControlPlaneIP(logger logr.Logger, metalCluster *api.MetalStackCluster) error {
-	req := &metalgo.IPAllocateRequest{
+	req := &models.V1IPAllocateRequest{
 		Name:      metalCluster.Name + "-api-server-IP",
-		Networkid: metalCluster.Spec.PublicNetworkID,
-		Projectid: metalCluster.Spec.ProjectID,
+		Networkid: &metalCluster.Spec.PublicNetworkID,
+		Projectid: &metalCluster.Spec.ProjectID,
 	}
+	var ipaddress string
 	if metalCluster.Spec.ControlPlaneEndpoint.Host != "" {
-		req.IPAddress = metalCluster.Spec.ControlPlaneEndpoint.Host
+		resp, err := r.mc.IP().AllocateSpecificIP(&ip.AllocateSpecificIPParams{Body: req, IP: metalCluster.Spec.ControlPlaneEndpoint.Host}, nil)
+		if err != nil {
+			logger.Info(fmt.Sprintf("Failed to allocate Control Plane IP %s", err))
+			return err
+		}
+		ipaddress = *resp.Payload.Ipaddress
+	} else {
+		resp, err := r.mc.IP().AllocateIP(&ip.AllocateIPParams{Body: req}, nil)
+		if err != nil {
+			logger.Info(fmt.Sprintf("Failed to allocate Control Plane IP %s", err))
+			return err
+		}
+		ipaddress = *resp.Payload.Ipaddress
 	}
-
-	resp, err := r.MetalStackClient.IPAllocate(req)
-	if err != nil {
-		logger.Info(fmt.Sprintf("Failed to allocate Control Plane IP %s", err))
-		return err
-	}
-
-	metalCluster.Spec.ControlPlaneEndpoint.Host = *resp.IP.Ipaddress
+	metalCluster.Spec.ControlPlaneEndpoint.Host = ipaddress
 	metalCluster.Status.ControlPlaneIPAllocated = true
 
-	logger.Info(fmt.Sprintf("Control Plane IP %s allocated", *resp.IP.Ipaddress))
+	logger.Info(fmt.Sprintf("Control Plane IP %s allocated", ipaddress))
 
 	return nil
 }

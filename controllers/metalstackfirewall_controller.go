@@ -23,6 +23,9 @@ import (
 	"github.com/go-logr/logr"
 	api "github.com/metal-stack/cluster-api-provider-metalstack/api/v1alpha4"
 	metalgo "github.com/metal-stack/metal-go"
+	metalfirewall "github.com/metal-stack/metal-go/api/client/firewall"
+	"github.com/metal-stack/metal-go/api/client/machine"
+	"github.com/metal-stack/metal-go/api/models"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	capi "sigs.k8s.io/cluster-api/api/v1alpha4"
@@ -35,18 +38,18 @@ import (
 
 // MetalStackFirewallReconciler reconciles a MetalStackFirewall object
 type MetalStackFirewallReconciler struct {
-	Client           client.Client
-	Log              logr.Logger
-	MetalStackClient MetalStackClient
-	Scheme           *runtime.Scheme
+	Client client.Client
+	Log    logr.Logger
+	mc     metalgo.Client
+	Scheme *runtime.Scheme
 }
 
-func NewMetalStackFirewallReconciler(metalClient MetalStackClient, mgr manager.Manager) *MetalStackFirewallReconciler {
+func NewMetalStackFirewallReconciler(c metalgo.Client, mgr manager.Manager) *MetalStackFirewallReconciler {
 	return &MetalStackFirewallReconciler{
-		Client:           mgr.GetClient(),
-		Log:              ctrl.Log.WithName("controllers").WithName("MetalStackCluster"),
-		MetalStackClient: metalClient,
-		Scheme:           mgr.GetScheme(),
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("controllers").WithName("MetalStackCluster"),
+		mc:     c,
+		Scheme: mgr.GetScheme(),
 	}
 }
 
@@ -110,19 +113,19 @@ func (r *MetalStackFirewallReconciler) reconcileDelete(
 		return ctrl.Result{}, fmt.Errorf("parse provider ID: %w", err)
 	}
 
-	resp, err := r.MetalStackClient.FirewallFind(&metalgo.FirewallFindRequest{
-		MachineFindRequest: metalgo.MachineFindRequest{
-			ID:                &id,
-			AllocationProject: &metalCluster.Spec.ProjectID,
+	resp, err := r.mc.Firewall().FindFirewalls(&metalfirewall.FindFirewallsParams{
+		Body: &models.V1FirewallFindRequest{
+			ID:                id,
+			AllocationProject: metalCluster.Spec.ProjectID,
 			Tags:              []string{metalCluster.GetClusterIDTag()},
 		},
-	})
+	}, nil)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("error finding firewalls: %w", err)
 	}
 
-	if len(resp.Firewalls) == 1 {
-		if _, err = r.MetalStackClient.MachineDelete(id); err != nil {
+	if len(resp.Payload) == 1 {
+		if _, err = r.mc.Machine().DeleteMachine(&machine.DeleteMachineParams{ID: id}, nil); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to delete the MetalStackFirewall %s: %w", firewall.Name, err)
 		}
 	}
@@ -144,17 +147,17 @@ func (r *MetalStackFirewallReconciler) reconcile(
 
 	// Check if the firewall was deployed successfully
 	if pid, err := firewall.Spec.ParsedProviderID(); err == nil {
-		resp, _ := r.MetalStackClient.MachineGet(pid)
-		if resp.Machine.Allocation != nil {
-			resp2, err := r.MetalStackClient.FirewallGet(pid)
+		resp, _ := r.mc.Machine().FindMachine(&machine.FindMachineParams{ID: pid}, nil)
+		if resp.Payload.Allocation != nil {
+			resp2, err := r.mc.Firewall().FindFirewall(&metalfirewall.FindFirewallParams{ID: pid}, nil)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to get firewall with ID %s: %w", pid, err)
 			}
 
-			succeded := *resp2.Firewall.Allocation.Succeeded
-			firewall.Status.Ready = succeded
+			succeeded := *resp2.Payload.Allocation.Succeeded
+			firewall.Status.Ready = succeeded
 
-			return ctrl.Result{Requeue: !succeded}, nil
+			return ctrl.Result{Requeue: !succeeded}, nil
 		}
 	}
 
@@ -162,7 +165,7 @@ func (r *MetalStackFirewallReconciler) reconcile(
 		return ctrl.Result{}, err
 	}
 
-	// Always requeue after successful firewall creation to check allocation in next reconcilation
+	// Always requeue after successful firewall creation to check allocation in next reconciliation
 	return ctrl.Result{Requeue: true}, nil
 }
 
@@ -185,18 +188,18 @@ func (r *MetalStackFirewallReconciler) createRawMachineIfNotExists(
 		return fmt.Errorf("Failed to generate firewall ignition config: %w", err)
 	}
 
-	machineCreateReq := metalgo.MachineCreateRequest{
-		Description:   firewall.Name + " created by Cluster API provider MetalStack",
-		Name:          firewall.Name,
-		Hostname:      firewall.Name + "-firewall",
-		Size:          firewall.Spec.MachineType,
-		Project:       metalCluster.Spec.ProjectID,
-		Partition:     metalCluster.Spec.Partition,
-		Image:         firewall.Spec.Image,
-		SSHPublicKeys: firewall.Spec.SSHKeys,
-		Networks:      toMachineNetworks(metalCluster.Spec.PublicNetworkID, *metalCluster.Spec.PrivateNetworkID),
-		UserData:      userData,
-		Tags:          []string{metalCluster.GetClusterIDTag()},
+	machineCreateReq := &models.V1FirewallCreateRequest{
+		Description: firewall.Name + " created by Cluster API provider MetalStack",
+		Name:        firewall.Name,
+		Hostname:    firewall.Name + "-firewall",
+		Sizeid:      &firewall.Spec.MachineType,
+		Projectid:   &metalCluster.Spec.ProjectID,
+		Partitionid: &metalCluster.Spec.Partition,
+		Imageid:     &firewall.Spec.Image,
+		SSHPubKeys:  firewall.Spec.SSHKeys,
+		Networks:    toMachineNetworks(metalCluster.Spec.PublicNetworkID, *metalCluster.Spec.PrivateNetworkID),
+		UserData:    userData,
+		Tags:        []string{metalCluster.GetClusterIDTag()},
 	}
 
 	// If ProviderID is provided set it in request
@@ -205,13 +208,13 @@ func (r *MetalStackFirewallReconciler) createRawMachineIfNotExists(
 		machineCreateReq.UUID = pid
 	}
 
-	resp, err := r.MetalStackClient.FirewallCreate(&metalgo.FirewallCreateRequest{
-		MachineCreateRequest: machineCreateReq,
-	})
+	resp, err := r.mc.Firewall().AllocateFirewall(&metalfirewall.AllocateFirewallParams{
+		Body: machineCreateReq,
+	}, nil)
 	if err != nil {
 		return err
 	}
 
-	firewall.Spec.SetProviderID(*resp.Firewall.ID)
+	firewall.Spec.SetProviderID(*resp.Payload.ID)
 	return nil
 }

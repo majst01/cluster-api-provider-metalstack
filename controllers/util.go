@@ -22,7 +22,8 @@ import (
 
 	"github.com/go-logr/logr"
 	api "github.com/metal-stack/cluster-api-provider-metalstack/api/v1alpha4"
-	metalgo "github.com/metal-stack/metal-go"
+	"github.com/metal-stack/metal-go/api/models"
+	"github.com/metal-stack/metal-lib/pkg/pointer"
 	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -32,11 +33,11 @@ const (
 	kubeconfigSecretNameTemplate = "%s-kubeconfig" // cluster_name-kubeconfig
 )
 
-func toMachineNetworks(networks ...string) (machineNetworks []metalgo.MachineAllocationNetwork) {
+func toMachineNetworks(networks ...string) (machineNetworks []*models.V1MachineAllocationNetwork) {
 	for _, network := range networks {
-		machineNetworks = append(machineNetworks, metalgo.MachineAllocationNetwork{
-			NetworkID:   network,
-			Autoacquire: true,
+		machineNetworks = append(machineNetworks, &models.V1MachineAllocationNetwork{
+			Networkid:   &network,
+			Autoacquire: pointer.Pointer(true),
 		})
 	}
 	return

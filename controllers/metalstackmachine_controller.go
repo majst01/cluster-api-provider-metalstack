@@ -25,6 +25,8 @@ import (
 
 	"github.com/go-logr/logr"
 	metalgo "github.com/metal-stack/metal-go"
+	"github.com/metal-stack/metal-go/api/client/machine"
+	"github.com/metal-stack/metal-go/api/models"
 	corev1 "k8s.io/api/core/v1"
 	capiv1 "sigs.k8s.io/cluster-api/api/v1alpha4"
 	capiremote "sigs.k8s.io/cluster-api/controllers/remote"
@@ -44,14 +46,14 @@ import (
 
 // MetalStackMachineReconciler reconciles a MetalStackMachine object
 type MetalStackMachineReconciler struct {
-	Client           client.Client
-	Log              logr.Logger
-	ClusterTracker   *capiremote.ClusterCacheTracker
-	MetalStackClient MetalStackClient
+	Client         client.Client
+	Log            logr.Logger
+	ClusterTracker *capiremote.ClusterCacheTracker
+	mc             metalgo.Client
 }
 
 // todo: Remove the dependency on manager in this package.
-func NewMetalStackMachineReconciler(metalClient MetalStackClient, mgr manager.Manager) (reconciler *MetalStackMachineReconciler, err error) {
+func NewMetalStackMachineReconciler(c metalgo.Client, mgr manager.Manager) (reconciler *MetalStackMachineReconciler, err error) {
 	clusterTracker, err := capiremote.NewClusterCacheTracker(
 		mgr,
 		capiremote.ClusterCacheTrackerOptions{
@@ -63,10 +65,10 @@ func NewMetalStackMachineReconciler(metalClient MetalStackClient, mgr manager.Ma
 	}
 
 	return &MetalStackMachineReconciler{
-		Client:           mgr.GetClient(),
-		Log:              ctrl.Log.WithName("controllers").WithName("MetalStackMachine"),
-		ClusterTracker:   clusterTracker,
-		MetalStackClient: metalClient,
+		Client:         mgr.GetClient(),
+		Log:            ctrl.Log.WithName("controllers").WithName("MetalStackMachine"),
+		ClusterTracker: clusterTracker,
+		mc:             c,
 	}, nil
 }
 
@@ -91,7 +93,7 @@ func (r *MetalStackMachineReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *MetalStackMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, err error) {
 	logger := r.Log.WithValues("MetalStackMachine", req.NamespacedName)
 
-	logger.Info("Starting MetalStackMachine reconcilation")
+	logger.Info("Starting MetalStackMachine reconciliation")
 
 	resources, err := newMetalStackMachineResources(ctx, logger, r.Client, req.NamespacedName)
 	if err != nil {
@@ -143,17 +145,18 @@ func (r *MetalStackMachineReconciler) reconcileDelete(ctx context.Context, resou
 		return ctrl.Result{}, fmt.Errorf("parse provider ID: %w", err)
 	}
 
-	resp, err := r.MetalStackClient.MachineFind(&metalgo.MachineFindRequest{
-		ID:                &id,
-		AllocationProject: &resources.metalCluster.Spec.ProjectID,
-		Tags:              []string{resources.metalCluster.GetClusterIDTag()},
-	})
+	resp, err := r.mc.Machine().FindMachines(&machine.FindMachinesParams{
+		Body: &models.V1MachineFindRequest{
+			ID:                id,
+			AllocationProject: resources.metalCluster.Spec.ProjectID,
+			Tags:              []string{resources.metalCluster.GetClusterIDTag()},
+		}}, nil)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("error finding machines: %w", err)
 	}
 
-	if len(resp.Machines) == 1 {
-		if _, err = r.MetalStackClient.MachineDelete(id); err != nil {
+	if len(resp.Payload) == 1 {
+		if _, err = r.mc.Machine().DeleteMachine(&machine.DeleteMachineParams{ID: id}, nil); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to delete the MetalStackMachine %s: %w", resources.metalMachine.Name, err)
 		}
 	}
@@ -195,12 +198,12 @@ func (r *MetalStackMachineReconciler) reconcile(ctx context.Context, resources *
 func (r *MetalStackMachineReconciler) createRawMachineIfNotExists(ctx context.Context, resources *metalStackMachineResources) error {
 	// Just checking if machine is already occupied
 	if pid, err := resources.metalMachine.Spec.ParsedProviderID(); err == nil {
-		resp, err := r.MetalStackClient.MachineGet(pid)
+		resp, err := r.mc.Machine().FindMachine(&machine.FindMachineParams{ID: pid}, nil)
 		if err != nil {
 			return fmt.Errorf("Failed to get machine with ID %s: %w", pid, err)
 		}
 
-		if resp.Machine.Allocation != nil {
+		if resp.Payload.Allocation != nil {
 			return nil
 		}
 	}
@@ -211,18 +214,18 @@ func (r *MetalStackMachineReconciler) createRawMachineIfNotExists(ctx context.Co
 		return fmt.Errorf("new createMachine request: %w", err)
 	}
 
-	resp, err := r.MetalStackClient.MachineCreate(req)
+	resp, err := r.mc.Machine().AllocateMachine(req, nil)
 	if err != nil {
 		// todo: When to unset?
 		resources.metalMachine.Status.SetFailure(err.Error(), capierr.CreateMachineError)
 		return err
 	}
 
-	resources.setProviderID(resp.Machine)
+	resources.setProviderID(resp.Payload)
 	return nil
 }
 
-func (r *MetalStackMachineReconciler) newRequestToCreateMachine(ctx context.Context, resources *metalStackMachineResources) (*metalgo.MachineCreateRequest, error) {
+func (r *MetalStackMachineReconciler) newRequestToCreateMachine(ctx context.Context, resources *metalStackMachineResources) (*machine.AllocateMachineParams, error) {
 	name := resources.metalMachine.Name
 	networks := toMachineNetworks(resources.metalCluster.Spec.PublicNetworkID, *resources.metalCluster.Spec.PrivateNetworkID)
 	userData, err := resources.getBootstrapData(ctx)
@@ -232,28 +235,30 @@ func (r *MetalStackMachineReconciler) newRequestToCreateMachine(ctx context.Cont
 		return nil, fmt.Errorf("get bootstrap data: %w", err)
 	}
 
-	config := &metalgo.MachineCreateRequest{
-		Hostname:      name,
-		Image:         resources.metalMachine.Spec.Image,
-		Name:          name,
-		Networks:      networks,
-		Partition:     resources.metalCluster.Spec.Partition,
-		Project:       resources.metalCluster.Spec.ProjectID,
-		Size:          resources.metalMachine.Spec.MachineType,
-		Tags:          resources.getTagsForRawMachine(),
-		SSHPublicKeys: resources.metalMachine.Spec.SSHKeys,
-		UserData:      string(userData),
+	config := &machine.AllocateMachineParams{
+		Body: &models.V1MachineAllocateRequest{
+			Hostname:    name,
+			Imageid:     &resources.metalMachine.Spec.Image,
+			Name:        name,
+			Networks:    networks,
+			Partitionid: &resources.metalCluster.Spec.Partition,
+			Projectid:   &resources.metalCluster.Spec.ProjectID,
+			Sizeid:      &resources.metalMachine.Spec.MachineType,
+			Tags:        resources.getTagsForRawMachine(),
+			SSHPubKeys:  resources.metalMachine.Spec.SSHKeys,
+			UserData:    string(userData),
+		},
 	}
 
 	// If ProviderID is provided set it in request
 	if pid, err := resources.metalMachine.Spec.ParsedProviderID(); err == nil {
 		resources.logger.Info(fmt.Sprintf("Deploy Node on machine: %s", pid))
-		config.UUID = pid
+		config.Body.UUID = pid
 	}
 
 	if resources.isControlPlane() {
 		resources.logger.Info("Creating ControlPlane node")
-		config.IPs = []string{resources.metalCluster.Spec.ControlPlaneEndpoint.Host}
+		config.Body.Ips = []string{resources.metalCluster.Spec.ControlPlaneEndpoint.Host}
 	} else {
 		resources.logger.Info("Creating worker node")
 	}

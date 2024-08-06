@@ -13,8 +13,7 @@
 # limitations under the License.
 
 # Build the manager binary
-ARG GOVER=1.16
-FROM golang:${GOVER} as builder
+FROM golang:1.22 as builder
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
